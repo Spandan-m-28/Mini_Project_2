@@ -1,16 +1,16 @@
-# rao1_fisa_pyspark.py
-# PySpark implementation of Rao-1 + FISA style update loop.
-# - Includes the pressure_vessel objective from your original script for quick test
-# - Shows clear placeholder where to implement frame cost from your attached PDF (manuscript_ijocta03259.pdf).
-#
-# Usage:
-#   spark-submit rao1_fisa_pyspark.py
-#
-# Notes:
-# - This implementation broadcasts the full population each iteration (ok for modest pop_size).
-# - The objective can be replaced by a more complex structural-cost evaluator. See placeholder below.
-# - Outputs results/tracking CSV to the output path configured below.
+# rao1_fisa_frame_cost_pyspark.py
+"""
+PySpark implementation: Rao-1 + FISA style optimizer for reinforced-concrete frame cost
+- Cost model follows Eq.(1) and Eq.(3) in Habte & Yilma (IJOCTA) and unit rates in Table 2.
+- Chromosome is value-encoded (indices -> discrete sizes / reinforcement options).
+- THIS SCRIPT DOES NOT PERFORM FULL STRUCTURAL ANALYSIS (stiffness matrix) --
+  it uses geometric & reinforcement constraints + cost model + simple penalties.
+  Integrate your structural analysis module into `evaluate_individual()` for full checks.
 
+References:
+- Habte, B. & Yilma, E., "Cost optimization of reinforced concrete frames using genetic algorithms", IJOCTA (2021).
+  Eq.(1), Eq.(3), Table 2 (unit rates), encoding/constraints descriptions. :contentReference[oaicite:5]{index=5} :contentReference[oaicite:6]{index=6}
+"""
 from pyspark.sql import SparkSession
 import numpy as np
 import random
@@ -19,258 +19,439 @@ import json
 import os
 from datetime import datetime
 
-# --- Configuration ---
-POP_SIZE = 200          # example pop size (tune for your cluster)
-DIM = 4                 # dimension (for pressure vessel example). For frame optimization set accordingly
-MAX_FES = 30000         # maximum function evaluations (global)
-LB = np.array([0.0625, 0.0625, 10.0, 10.0])   # lower bounds (pressure vessel)
-UB = np.array([99.0, 99.0, 200.0, 240.0])    # upper bounds (pressure vessel)
-TRACK_EVERY_FE = 1000   # save tracking results every this many function evaluations
-OUTPUT_DIR = "rao1_fisa_results"  # local or HDFS path (make sure cluster user can write)
+# ---------------- USER CONFIG ----------------
+POP_SIZE = 200
+MAX_FES = 20000
 SEED = 42
+OUTPUT_DIR = "rao1_frame_results"
+TRACK_EVERY = 2000
 
-# For reproducibility
 random.seed(SEED)
 np.random.seed(SEED)
 
-# --- Create Spark session ---
-spark = SparkSession.builder.appName("Rao1_FISA_PySpark").getOrCreate()
-sc = spark.sparkContext
-
-# Ensure output directory exists (driver-local; change for HDFS)
+# make output dir
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# --- Objective functions ---
-def pressure_vessel(solution):
-    """
-    Direct translation of your original pressure_vessel function.
-    Returns very large penalty for constraint violation.
-    """
-    x1, x2, x3, x4 = solution
-    g1 = -x1 + 0.0193 * x3
-    g2 = -x2 + 0.00954 * x3
-    g3 = 1296000 - (4.0 / 3.0) * math.pi * (x3 ** 3) - math.pi * (x3 ** 2) * x4
-    g4 = x4 - 240.0
+# ---------------- UNIT RATES from Table 2 (paper) ----------------
+UNIT_STEEL_EU_PER_KG = 1.30        # €/kg
+UNIT_CONCRETE_EU_PER_M3 = 112.13   # €/m^3
+UNIT_FORM_BEAM_EU_PER_M2 = 25.05   # €/m^2 (beams formwork)
+UNIT_FORM_COLUMN_EU_PER_M2 = 22.75 # €/m^2 (columns formwork)
+UNIT_SCAFFOLD_BEAM_EU_PER_M2 = 38.89 # €/m^2 (scaffolding beams)
 
-    if (g1 <= 0) and (g2 <= 0) and (g3 <= 0) and (g4 <= 0):
-        return 0.6224 * x1 * x3 * x4 + 1.7781 * x2 * (x3 ** 2) + 3.1661 * (x1 ** 2) * x4 + 19.84 * (x1 ** 2) * x3
-    else:
-        return 1e10
+STEEL_DENSITY = 7850.0  # kg/m^3
 
-# -------------------------
-# PLACEHOLDER for your real objective:
-# The manuscript_ijocta03259.pdf contains a structural cost function:
-#   Minimize total cost = sum(cost_concrete + cost_steel + cost_formwork) (Eq. (1) and (3) in the PDF).
-# Implement an evaluator similar to the pressure_vessel() above but computing:
-#   - decode individual's chromosome -> member sizes, reinforcement indices (see Section 4 of the PDF)
-#   - run structural analysis (or use simplified formulas) to produce internal actions
-#   - compute cost using unit rates (Table 2 in the PDF) and add penalties for constraint violations
-# Example skeleton function:
-def evaluate_individual_frame(individual, params=None):
+# ----------------- Encoding domains -----------------
+# Section sizes (breadth/height) discrete choices: from 200mm to 500mm step 25mm
+SECTION_SIZES_MM = list(range(200, 525, 25))  # mm
+SECTION_SIZES_M = [v / 1000.0 for v in SECTION_SIZES_MM]  # m
+
+# Available bar diameters (mm) for continuous and additional reinforcement
+BAR_DIAMETERS_MM = [8, 10, 12, 16, 20, 25]  # typical
+BAR_AREA_M2 = [(math.pi * (d/1000.0)**2 / 4.0) for d in BAR_DIAMETERS_MM]  # m^2 per bar
+
+# Stirrup spacing options in mm (100 - 350 with variety)
+STIRRUP_SPACING_MM = [100, 120, 150, 170, 200, 230, 260, 300, 350]
+
+# Minimal domain checks (from paper: min width 200mm, b/h ratio limit 0.5 - 2.0)
+MIN_SECTION_B_MM = 200
+BH_RATIO_MIN = 0.5
+BH_RATIO_MAX = 2.0
+
+# Reinforcement ratio limits (typical values). Paper mentions min/max but not explicit numbers;
+# choose conservative defaults (can be adjusted or read from input).
+REINF_RATIO_MIN = 0.005   # 0.5% (minimum reinforcement ratio)
+REINF_RATIO_MAX = 0.06    # 6% (maximum reinforcement ratio)
+
+# ----------------- FRAME DATA (example) -----------------
+# A tiny 2-bay, 2-story planar frame example. Replace with your real frame description or load JSON.
+FRAME_DEF = {
+    "n_beams": 4,               # total horizontal members
+    "n_columns": 4,             # total vertical members
+    # lengths in meters for each member (for simplicity we take uniform lengths)
+    "beam_length_m": 3.0,
+    "column_length_m": 3.0,
+    # Assume beams are rectangular prismatic elements; columns likewise.
+    # For a real structure you would provide per-member lengths and classification (beam/column).
+}
+
+# For encoding: number of genes per beam and per column
+# Following the paper: 8 indices per beam, 5 indices per column (typical scheme described).
+GENES_PER_BEAM = 8
+GENES_PER_COLUMN = 5
+
+TOTAL_GENES = FRAME_DEF["n_beams"] * GENES_PER_BEAM + FRAME_DEF["n_columns"] * GENES_PER_COLUMN
+
+# ---------------- helper functions ----------------
+def random_chromosome():
     """
-    Replace this stub with the cost/evaluation logic from manuscript_ijocta03259.pdf.
-    - `individual` is a numpy array or Python list encoding decision variables (widths, heights, reinforcement indices...).
-    - `params` can carry unit costs, topology, load cases, code parameters.
-    Return: float fitness (lower is better).
+    Generate a random chromosome (array of indices)
+    Gene ordering (per beam): [b_idx, h_idx, cont_top_bar_idx, cont_bottom_bar_idx,
+                              pos_add_bar_idx, neg_add_bar_idx, stirrup_spacing_idx, stirrup_spacing_idx2]
+    (adjustable)
+    For columns: [b_idx, h_idx, cont_bar_idx, pos_add_bar_idx, stirrup_spacing_idx]
     """
-    # Example (VERY simplified): decode just two members' area and compute dummy cost.
-    # **YOU MUST REPLACE THIS** with the real decode/evaluate steps from the paper.
-    # Use params to broadcast any large structures (topology, unit rates).
-    a = float(individual[0])
-    b = float(individual[1]) if len(individual) > 1 else a
-    # simplified "cost"
-    cost_concrete = 112.13 * (a * b * 1.0)   # unit cost * volume (dummy)
-    cost_steel = 1.30 * (a * 10.0)           # dummy
+    chrom = []
+    # beams
+    for _ in range(FRAME_DEF["n_beams"]):
+        # b_idx, h_idx
+        chrom.append(random.randrange(len(SECTION_SIZES_MM)))  # b
+        chrom.append(random.randrange(len(SECTION_SIZES_MM)))  # h
+        # continuous top/bottom bar choices (index into BAR_DIAMETERS_MM)
+        chrom.append(random.randrange(len(BAR_DIAMETERS_MM)))
+        chrom.append(random.randrange(len(BAR_DIAMETERS_MM)))
+        # positive / negative additional bars
+        chrom.append(random.randrange(len(BAR_DIAMETERS_MM)))
+        chrom.append(random.randrange(len(BAR_DIAMETERS_MM)))
+        # two stirrup spacing indices
+        chrom.append(random.randrange(len(STIRRUP_SPACING_MM)))
+        chrom.append(random.randrange(len(STIRRUP_SPACING_MM)))
+    # columns
+    for _ in range(FRAME_DEF["n_columns"]):
+        chrom.append(random.randrange(len(SECTION_SIZES_MM)))  # b
+        chrom.append(random.randrange(len(SECTION_SIZES_MM)))  # h
+        chrom.append(random.randrange(len(BAR_DIAMETERS_MM)))  # cont bar
+        chrom.append(random.randrange(len(BAR_DIAMETERS_MM)))  # add bar
+        chrom.append(random.randrange(len(STIRRUP_SPACING_MM)))
+    return chrom
+
+def decode_chromosome(chrom):
+    """
+    Decode integer-index chromosome into physical sizes & reinforcement.
+    Returns dictionary with per-member geometry & reinforcement data.
+    """
+    data = {"beams": [], "columns": []}
+    idx = 0
+    # beams
+    for b in range(FRAME_DEF["n_beams"]):
+        b_idx = chrom[idx]; idx += 1
+        h_idx = chrom[idx]; idx += 1
+        cont_top_idx = chrom[idx]; idx += 1
+        cont_bot_idx = chrom[idx]; idx += 1
+        pos_add_idx = chrom[idx]; idx += 1
+        neg_add_idx = chrom[idx]; idx += 1
+        stir1_idx = chrom[idx]; idx += 1
+        stir2_idx = chrom[idx]; idx += 1
+
+        beam = {
+            "b_m": SECTION_SIZES_M[b_idx],
+            "h_m": SECTION_SIZES_M[h_idx],
+            "cont_top_d_mm": BAR_DIAMETERS_MM[cont_top_idx],
+            "cont_bot_d_mm": BAR_DIAMETERS_MM[cont_bot_idx],
+            "pos_add_d_mm": BAR_DIAMETERS_MM[pos_add_idx],
+            "neg_add_d_mm": BAR_DIAMETERS_MM[neg_add_idx],
+            "stirrup_spacing_mm": STIRRUP_SPACING_MM[stir1_idx],
+            "stirrup_spacing_mm2": STIRRUP_SPACING_MM[stir2_idx],
+            "length_m": FRAME_DEF["beam_length_m"]
+        }
+        data["beams"].append(beam)
+    # columns
+    for c in range(FRAME_DEF["n_columns"]):
+        b_idx = chrom[idx]; idx += 1
+        h_idx = chrom[idx]; idx += 1
+        cont_idx = chrom[idx]; idx += 1
+        add_idx = chrom[idx]; idx += 1
+        stir_idx = chrom[idx]; idx += 1
+
+        col = {
+            "b_m": SECTION_SIZES_M[b_idx],
+            "h_m": SECTION_SIZES_M[h_idx],
+            "cont_d_mm": BAR_DIAMETERS_MM[cont_idx],
+            "add_d_mm": BAR_DIAMETERS_MM[add_idx],
+            "stirrup_spacing_mm": STIRRUP_SPACING_MM[stir_idx],
+            "length_m": FRAME_DEF["column_length_m"]
+        }
+        data["columns"].append(col)
+    return data
+
+def compute_cost_and_penalty(decoded):
+    """
+    Compute total cost using Eq.(3)-like expressions (concrete, steel, formwork) and
+    compute penalty for simple constraints (min size, b/h ratio, reinforcement ratio).
+    Returns (cost_euro, penalty_scalar)
+    """
+    total_concrete_vol_m3 = 0.0
+    total_steel_kg = 0.0
+    total_form_area_m2_beams = 0.0
+    total_form_area_m2_columns = 0.0
+    total_scaffold_area_m2_beams = 0.0
+
     penalty = 0.0
-    return cost_concrete + cost_steel + penalty
 
-# -------------------------
+    # beams
+    for beam in decoded["beams"]:
+        b = beam["b_m"]; h = beam["h_m"]; L = beam["length_m"]
+        # approximate member concrete volume as b*h*L
+        vol = b * h * L
+        total_concrete_vol_m3 += vol
 
-# Choose which objective to use:
-USE_FRAME_OBJECTIVE = False   # set True to use evaluate_individual_frame (after you implement it)
-def evaluate(solution):
-    if USE_FRAME_OBJECTIVE:
-        return evaluate_individual_frame(solution, params=None)
-    else:
-        return pressure_vessel(solution)
+        # approximate steel: continuous top/bottom: assume 2 bars each (paper used two bars top/bot)
+        cont_top_area = math.pi * (beam["cont_top_d_mm"]/1000.0)**2 / 4.0
+        cont_bot_area = math.pi * (beam["cont_bot_d_mm"]/1000.0)**2 / 4.0
+        # assume 2 bars each side for continuous bars (paper: two bars at top and bottom)
+        cont_total_area = (cont_top_area * 2.0 + cont_bot_area * 2.0)
+        # additional bars: assume 2 bars for pos and 2 for neg (approx)
+        pos_add_area = math.pi * (beam["pos_add_d_mm"]/1000.0)**2 / 4.0
+        neg_add_area = math.pi * (beam["neg_add_d_mm"]/1000.0)**2 / 4.0
+        add_total_area = (pos_add_area * 2.0 + neg_add_area * 2.0)
+        # stirrups: estimate total length of stirrups per beam as perimeter * (L / spacing)
+        spacing = beam["stirrup_spacing_mm"]/1000.0
+        spacing2 = beam["stirrup_spacing_mm2"]/1000.0
+        # use min spacing of the two indices (conservative)
+        spacing_use = min(spacing, spacing2)
+        if spacing_use <= 0.0:
+            spacing_use = 0.1
+        perimeter = 2.0 * (b + h)
+        n_stirrups = max(1, int(math.ceil(L / spacing_use)))
+        # assume stirrup bar dia = 8mm as paper; total length per stirrup = perimeter + hooks ~ perimeter * 1.15
+        stirrup_bar_d_mm = 8
+        stirrup_len = perimeter * 1.15
+        stirrup_area_per_bar = math.pi * (stirrup_bar_d_mm/1000.0)**2 / 4.0
+        total_stirrups_area = stirrup_area_per_bar * n_stirrups
 
-# --- Utility functions for PySpark mapping ---
-def make_initial_population(pop_size, dim, lb, ub):
-    # returns a numpy array shape (pop_size, dim)
-    return np.random.rand(pop_size, dim) * (ub - lb) + lb
+        # steel area per unit length (m^2 per m)
+        steel_area_m2 = (cont_total_area + add_total_area + total_stirrups_area)
+        # mass = area (m^2) * length (m) * density
+        steel_mass_kg = steel_area_m2 * L * STEEL_DENSITY
+        total_steel_kg += steel_mass_kg
 
-# RDD element structure: (idx, position_list, fitness)
-def pack_population(pop_array):
-    pop = []
-    for i in range(pop_array.shape[0]):
-        pos = pop_array[i].tolist()
-        fitness = float(evaluate(pos))
-        pop.append( (i, pos, fitness) )
-    return pop
+        # formwork area (top + bottom + sides) approx: 2*(b*L) + 2*(h*L) -> simplified as perimeter * L
+        form_area_beam = perimeter * L
+        total_form_area_m2_beams += form_area_beam
 
-def update_individual(args):
-    """
-    Map function to update a single individual using Rao-1 + FISA style step.
-    It receives a tuple:
-       (i, pos, fitness, pop_broadcast_value, best_pos, worst_pos, lb, ub)
-    and returns (i, new_pos, new_fitness)
-    """
-    (i, pos, fitness, pop_list, best_pos, worst_pos, lb_list, ub_list) = args
-    dim = len(pos)
-    pos_arr = np.array(pos, dtype=float)
-    pos_copy = pos_arr.copy()
-    pop_arr = np.array(pop_list)  # shape (pop_size, dim)
+        # scaffolding: approximate as beam plan area (b * L) times some factor -> use b*L
+        total_scaffold_area_m2_beams += (b * L)
 
-    # apply Rao-1 + FISA-like update per-dimension
-    for j in range(dim):
-        r1 = random.random()
-        r2 = random.random()
-        term1 = r1 * (best_pos[j] - worst_pos[j])
+        # simple sizing constraints penalties
+        if (b * 1000.0) < MIN_SECTION_B_MM or (h * 1000.0) < MIN_SECTION_B_MM:
+            penalty += 2.0  # arbitrary penalty for too small dimension
+        # b/h ratio
+        bh = b / h if h > 0 else 1.0
+        if bh < BH_RATIO_MIN or bh > BH_RATIO_MAX:
+            penalty += 1.0
 
-        # pick random other index
-        rand_idx = random.randint(0, pop_arr.shape[0] - 1)
-        mx = max(pos_copy[j], pop_arr[rand_idx][j])
-        term2 = r2 * (pos_copy[j] - mx)
+        # reinforcement ratio (steel area / concrete gross area): approximate
+        gross_area = b * h
+        if gross_area > 0:
+            rho = (cont_total_area + add_total_area) / gross_area
+            if rho < REINF_RATIO_MIN:
+                penalty += (REINF_RATIO_MIN - rho) * 100.0
+            if rho > REINF_RATIO_MAX:
+                penalty += (rho - REINF_RATIO_MAX) * 100.0
 
-        pos_arr[j] += term1 + term2
+    # columns
+    for col in decoded["columns"]:
+        b = col["b_m"]; h = col["h_m"]; L = col["length_m"]
+        vol = b * h * L
+        total_concrete_vol_m3 += vol
 
-        # clip to bounds
-        pos_arr[j] = max(lb_list[j], min(ub_list[j], pos_arr[j]))
+        # continuous bars: assume 4 bars for column continuous
+        cont_area = math.pi * (col["cont_d_mm"]/1000.0)**2 / 4.0
+        add_area = math.pi * (col["add_d_mm"]/1000.0)**2 / 4.0
+        # assume 4 continuous bars, plus 4 additional bars
+        steel_area_m2 = (cont_area * 4.0 + add_area * 4.0)
+        # stirrups
+        spacing = col["stirrup_spacing_mm"]/1000.0
+        perimeter = 2.0 * (b + h)
+        n_stirrups = max(1, int(math.ceil(L / (spacing if spacing > 0 else 0.1))))
+        stirrup_bar_d_mm = 8
+        stirrup_len = perimeter * 1.15
+        stirrup_area_per_bar = math.pi * (stirrup_bar_d_mm/1000.0)**2 / 4.0
+        total_stirrups_area = stirrup_area_per_bar * n_stirrups
 
-    new_fit = evaluate(pos_arr.tolist())
-    # If new is worse (higher), revert to copy (as in your original code)
-    if new_fit > fitness:
-        return (i, pos_copy.tolist(), float(fitness))
-    else:
-        return (i, pos_arr.tolist(), float(new_fit))
+        steel_area_m2 += total_stirrups_area
+        steel_mass_kg = steel_area_m2 * L * STEEL_DENSITY
+        total_steel_kg += steel_mass_kg
 
+        form_area_col = perimeter * L
+        total_form_area_m2_columns += form_area_col
 
-# --- Main optimization loop (driver-driven broadcast) ---
-def run_rao1_fisa(sc,
-                   pop_size=POP_SIZE,
-                   dim=DIM,
-                   lb=LB,
-                   ub=UB,
-                   max_fes=MAX_FES,
-                   track_every=TRACK_EVERY_FE):
-    # initialize population on driver
-    pop = make_initial_population(pop_size, dim, lb, ub)
-    # pack into RDD items with fitness
-    pop_items = pack_population(pop)
-    # Create an RDD (we will re-broadcast/populate each iteration)
-    pop_rdd = sc.parallelize(pop_items, numSlices=min(8, pop_size))
+        # sizing constraints
+        if (b * 1000.0) < MIN_SECTION_B_MM or (h * 1000.0) < MIN_SECTION_B_MM:
+            penalty += 2.0
+        bh = b / h if h > 0 else 1.0
+        if bh < BH_RATIO_MIN or bh > BH_RATIO_MAX:
+            penalty += 1.0
+        gross_area = b * h
+        if gross_area > 0:
+            rho = (cont_area * 4.0 + add_area * 4.0) / gross_area
+            if rho < REINF_RATIO_MIN:
+                penalty += (REINF_RATIO_MIN - rho) * 100.0
+            if rho > REINF_RATIO_MAX:
+                penalty += (rho - REINF_RATIO_MAX) * 100.0
 
-    fes = 0
-    iter_no = 0
-    results_tracking = []  # list of dicts for later saving
+    # compute cost components using unit rates
+    cost_concrete = total_concrete_vol_m3 * UNIT_CONCRETE_EU_PER_M3
+    cost_steel = total_steel_kg * UNIT_STEEL_EU_PER_KG
+    cost_formwork = total_form_area_m2_beams * UNIT_FORM_BEAM_EU_PER_M2 + total_form_area_m2_columns * UNIT_FORM_COLUMN_EU_PER_M2
+    cost_scaffold = total_scaffold_area_m2_beams * UNIT_SCAFFOLD_BEAM_EU_PER_M2
 
-    max_iter = max_fes // pop_size
-    if max_iter < 1:
-        max_iter = 1
+    total_cost = cost_concrete + cost_steel + cost_formwork + cost_scaffold
 
-    while fes < max_fes and iter_no < max_iter:
-        # collect current population to driver for easy best/worst identification
-        pop_list = pop_rdd.collect()  # relatively small (pop_size)
-        # pop_list elements: (i, pos, fitness)
-        positions = np.array([item[1] for item in pop_list])
-        fitnesses = np.array([item[2] for item in pop_list])
-
-        best_idx = int(np.argmin(fitnesses))
-        worst_idx = int(np.argmax(fitnesses))
-        best_pos = positions[best_idx].tolist()
-        worst_pos = positions[worst_idx].tolist()
-        best_score = float(fitnesses[best_idx])
-
-        # tracking
-        if (fes % track_every) == 0:
-            results_tracking.append({
-                "fes": fes,
-                "iter": iter_no,
-                "best_score": best_score,
-                "best_pos": best_pos
-            })
-            print(f"[Iter {iter_no}] FEs={fes} Best={best_score:.6f}")
-
-        # broadcast current population and bounds and best/worst
-        b_pop = sc.broadcast(positions.tolist())
-        b_best = sc.broadcast(best_pos)
-        b_worst = sc.broadcast(worst_pos)
-        b_lb = sc.broadcast(lb.tolist())
-        b_ub = sc.broadcast(ub.tolist())
-
-        # Prepare RDD elements for update: convert to tuples with broadcast data included
-        # To avoid re-collect inside map, create an RDD of tuples where each partition receives needed broadcasts.
-        update_input = pop_rdd.map(lambda item: (
-            item[0],    # idx
-            item[1],    # pos
-            item[2],    # fitness
-            b_pop.value,
-            b_best.value,
-            b_worst.value,
-            b_lb.value,
-            b_ub.value
-        ))
-
-        # Perform update in parallel
-        updated = update_input.map(update_individual)
-
-        # force evaluation and create new pop_rdd
-        updated_list = updated.collect()
-        fes += pop_size
-        iter_no += 1
-
-        # make new RDD for next iteration
-        pop_rdd = sc.parallelize(updated_list, numSlices=min(8, pop_size))
-
-        # optional: unpersist broadcasts
-        b_pop.unpersist()
-        b_best.unpersist()
-        b_worst.unpersist()
-        b_lb.unpersist()
-        b_ub.unpersist()
-
-    # final collection
-    final_pop = pop_rdd.collect()
-    # compute final best
-    fitnesses = np.array([item[2] for item in final_pop])
-    positions = np.array([item[1] for item in final_pop])
-    best_idx = int(np.argmin(fitnesses))
-    best_score = float(fitnesses[best_idx])
-    best_pos = positions[best_idx].tolist()
-
-    # Save tracking results as CSV-like file
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    out_path = os.path.join(OUTPUT_DIR, f"rao1_fisa_tracking_{ts}.csv")
-    with open(out_path, "w") as fh:
-        fh.write("fes,iter,best_score,best_pos\n")
-        for rec in results_tracking:
-            fh.write(f"{rec['fes']},{rec['iter']},{rec['best_score']},\"{json.dumps(rec['best_pos'])}\"\n")
-    print("Saved tracking to", out_path)
-
-    # Also save final population
-    pop_out_path = os.path.join(OUTPUT_DIR, f"rao1_fisa_population_{ts}.csv")
-    with open(pop_out_path, "w") as fh:
-        fh.write("idx,fitness,position\n")
-        for item in final_pop:
-            fh.write(f"{item[0]},{item[2]},\"{json.dumps(item[1])}\"\n")
-    print("Saved final population to", pop_out_path)
+    # paper uses fitness = C * (1 + p) or F = C * (1 + p) ? The paper defines F = C + p*C? (Eq.6: F = C (1 + p) or F = C + p ?)
+    # In the paper the fitness is described as F = C + p * C? Eq.(6) is shown as F = C + p*C? We'll use a common approach:
+    # Fitness = total_cost * (1 + penalty) where penalty is a small scalar (penalty may already be large)
+    fitness = total_cost * (1.0 + penalty)
 
     return {
-        "best_score": best_score,
-        "best_pos": best_pos,
-        "tracking_file": out_path,
-        "population_file": pop_out_path
+        "cost_concrete": cost_concrete,
+        "cost_steel": cost_steel,
+        "cost_formwork": cost_formwork,
+        "cost_scaffold": cost_scaffold,
+        "total_cost": total_cost,
+        "penalty": penalty,
+        "fitness": fitness
     }
 
+# ----------------- Evaluation wrapper -----------------
+def evaluate_chromosome(chrom):
+    decoded = decode_chromosome(chrom)
+    res = compute_cost_and_penalty(decoded)
+    return res["fitness"], res
+
+# ----------------- Optimization (Rao-1 + FISA style adapted for discrete indices) -----------------
+def initialize_population(pop_size):
+    pop = []
+    for i in range(pop_size):
+        c = random_chromosome()
+        fitness, _ = evaluate_chromosome(c)
+        pop.append((i, c, fitness))
+    return pop
+
+def clamp_and_round_chrom(chrom):
+    """Ensure indices are integer and within domains."""
+    chrom2 = []
+    idx = 0
+    # beams
+    for _ in range(FRAME_DEF["n_beams"]):
+        # b_idx
+        v = int(round(chrom[idx])); idx+=1
+        v = max(0, min(len(SECTION_SIZES_MM)-1, v)); chrom2.append(v)
+        v = int(round(chrom[idx])); idx+=1
+        v = max(0, min(len(SECTION_SIZES_MM)-1, v)); chrom2.append(v)
+        for _ in range(6):
+            v = int(round(chrom[idx])); idx+=1
+            # for bars and stirrups different ranges:
+            # first 4 are bars -> BAR range
+            if len(chrom2) % 1 == 0: pass
+            # For simplicity, map according to expected order:
+            # cont_top, cont_bot, pos_add, neg_add -> BAR indices
+            # stir1, stir2 -> STIRRUP indices
+            if len(chrom2) % 1 == 0:
+                pass
+            # We'll just clip using appropriate sizes by position
+            # Determine which one we are at by counting how many we've added since beam start
+            # But for simplicity we just rely on values and clip to max of combined spaces:
+            if len(chrom2) < 2 + 4:
+                # if we are still at bar-related entries, clip to BAR range
+                v = max(0, min(len(BAR_DIAMETERS_MM)-1, v))
+            else:
+                v = max(0, min(len(STIRRUP_SPACING_MM)-1, v))
+            chrom2.append(v)
+    # columns: the remaining genes
+    # After above loop idx currently at 8*#beams
+    for _ in range(FRAME_DEF["n_columns"]):
+        v = int(round(chrom[idx])); idx+=1
+        v = max(0, min(len(SECTION_SIZES_MM)-1, v)); chrom2.append(v)
+        v = int(round(chrom[idx])); idx+=1
+        v = max(0, min(len(SECTION_SIZES_MM)-1, v)); chrom2.append(v)
+        v = int(round(chrom[idx])); idx+=1
+        v = max(0, min(len(BAR_DIAMETERS_MM)-1, v)); chrom2.append(v)
+        v = int(round(chrom[idx])); idx+=1
+        v = max(0, min(len(BAR_DIAMETERS_MM)-1, v)); chrom2.append(v)
+        v = int(round(chrom[idx])); idx+=1
+        v = max(0, min(len(STIRRUP_SPACING_MM)-1, v)); chrom2.append(v)
+    return chrom2
+
+def rao1_fisa_update(pop):
+    """
+    One iteration of Rao-1 + FISA adapted to integer-index chromosomes.
+    pop: list of (idx, chromosome_list, fitness)
+    returns new population list of same structure
+    """
+    pop_size = len(pop)
+    # prepare arrays
+    chroms = [np.array(ind[1], dtype=float) for ind in pop]
+    fitnesses = np.array([ind[2] for ind in pop])
+    best_idx = int(np.argmin(fitnesses))
+    worst_idx = int(np.argmax(fitnesses))
+    best = chroms[best_idx]
+    worst = chroms[worst_idx]
+
+    new_pop = []
+    for i, (idx0, chrom, fit) in enumerate(pop):
+        x = chroms[i].copy()
+        x_new = x.copy()
+        for j in range(len(x)):
+            r1 = random.random()
+            r2 = random.random()
+            term1 = r1 * (best[j] - worst[j])
+            # pick random other individual
+            rand_idx = random.randrange(pop_size)
+            term2 = r2 * (x[j] - chroms[rand_idx][j])
+            x_new[j] = x[j] + term1 + term2
+        # clamp to reasonable ranges: because all genes are integer indices we clamp to [0, max_index_for_that_gene]
+        # Build per-gene max based on gene position
+        # We will round and clip using clamp_and_round_chrom
+        chrom_ints = clamp_and_round_chrom(x_new.tolist())
+        new_fit, _ = evaluate_chromosome(chrom_ints)
+        # greedy replacement (accept if better)
+        if new_fit <= fit:
+            new_pop.append((idx0, chrom_ints, new_fit))
+        else:
+            new_pop.append((idx0, pop[i][1], fit))
+    return new_pop
+
+# --------------- Driver optimization loop (single-process driver uses evaluation function) ---------------
+def run_optimization(pop_size=POP_SIZE, max_fes=MAX_FES):
+    pop = initialize_population(pop_size)
+    fes = pop_size
+    iter_no = 0
+    best_history = []
+    while fes < max_fes:
+        pop = rao1_fisa_update(pop)
+        # count FEs: we evaluated at most pop_size individuals (one update per individual)
+        fes += pop_size
+        iter_no += 1
+        fitnesses = [p[2] for p in pop]
+        best_idx = int(np.argmin(fitnesses))
+        best_val = fitnesses[best_idx]
+        best_chrom = pop[best_idx][1]
+        best_history.append((fes, iter_no, best_val, best_chrom))
+        if (iter_no % 10) == 0:
+            print(f"[Iter {iter_no}] FEs={fes} Best={best_val:.4f}")
+    # final
+    fitnesses = [p[2] for p in pop]
+    best_idx = int(np.argmin(fitnesses))
+    best_chrom = pop[best_idx][1]
+    best_fit, best_res = evaluate_chromosome(best_chrom)
+    # save results
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    track_path = os.path.join(OUTPUT_DIR, f"tracking_{ts}.csv")
+    with open(track_path, "w") as fh:
+        fh.write("fes,iter,best_fit,best_chrom\n")
+        for rec in best_history:
+            fh.write(f"{rec[0]},{rec[1]},{rec[2]},\"{json.dumps(rec[3])}\"\n")
+    pop_path = os.path.join(OUTPUT_DIR, f"best_{ts}.json")
+    with open(pop_path, "w") as fh:
+        fh.write(json.dumps({
+            "best_fit": best_fit,
+            "best_chrom": best_chrom,
+            "decoded": decode_chromosome(best_chrom),
+            "metrics": best_res
+        }, indent=2))
+    print("Done. Best fitness:", best_fit)
+    print("Saved tracking:", track_path)
+    print("Saved best:", pop_path)
+    return best_fit, best_chrom, best_res
+
 if __name__ == "__main__":
-    print("Starting Rao-1 + FISA PySpark run")
-    res = run_rao1_fisa(sc,
-                        pop_size=POP_SIZE,
-                        dim=DIM,
-                        lb=LB,
-                        ub=UB,
-                        max_fes=MAX_FES,
-                        track_every=TRACK_EVERY_FE)
-    print("Run complete. Best score:", res["best_score"])
-    print("Best pos:", res["best_pos"])
-    spark.stop()
+    # This script is intentionally simple in Spark usage: the heavy work here is evaluate_chromosome,
+    # which is executed on the driver. For large populations or expensive structural analysis,
+    # evaluate_chromosome must be executed in parallel on workers (see notes below).
+    print("Starting Rao-1 + FISA discrete optimization for frame cost (example).")
+    best_fit, best_chrom, best_res = run_optimization()
+    print("Best fitness (final):", best_fit)
+    print("Best decoded design (summary):")
+    print(json.dumps(decode_chromosome(best_chrom), indent=2))
+    print("Cost breakdown:", {k: round(v,2) for k,v in best_res.items() if k!='fitness'})
